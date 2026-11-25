@@ -1,0 +1,199 @@
+# Adapter les entités et les puissances selon le README.
+template:
+  - sensor:
+      - name: "PV potentiel pyranomètre"
+        default_entity_id: sensor.pv_potentiel_pyranometre
+        unique_id: pv_potentiel_pyr20
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        availability: "{{ is_number(states('sensor.toiture_pyranometre_irradiance_solaire')) }}"
+        state: >-
+          {% set g = states('sensor.toiture_pyranometre_irradiance_solaire') | float(0) %}
+          {% set wc = 5000 %}
+          {% set plafond_ac = 4500 %}
+          {% set k = 1.0 %}
+          {{ [plafond_ac, [0, wc * g / 1000 * k] | max] | min | round(0) }}
+
+      - name: "Surplus disponible borne"
+        default_entity_id: sensor.surplus_disponible_borne
+        unique_id: surplus_disponible_borne
+        unit_of_measurement: W
+        device_class: power
+        state_class: measurement
+        availability: >-
+          {{ is_number(states('sensor.toiture_pyranometre_irradiance_solaire'))
+             and is_number(states('sensor.pv_potentiel_lisse'))
+             and is_number(states('sensor.izypower_cloud_maison_consommation'))
+             and is_number(states('sensor.izypower_cloud_maison_puissance_batterie')) }}
+        state: >-
+          {% set pv = states('sensor.pv_potentiel_lisse') | float(0) %}
+          {% set maison = states('sensor.izypower_cloud_maison_consommation') | float(0) %}
+          {% set batterie = states('sensor.izypower_cloud_maison_puissance_batterie') | float(0) %}
+          {{ pv - maison - [0, batterie] | max }}
+
+  - binary_sensor:
+      - name: Borne conditions solaires
+        default_entity_id: binary_sensor.borne_conditions_solaires
+        unique_id: borne_conditions_solaires
+        state: >-
+          {% set age = now().timestamp() - as_timestamp(states('sensor.izypower_cloud_maison_derniere_mise_a_jour'),0) %}
+          {{ is_state('sun.sun','above_horizon') and is_state('binary_sensor.heures_creuses','off')
+             and is_state('binary_sensor.vehicule_branche','on')
+             and is_number(states('sensor.surplus_disponible_borne')) and 0 <= age <= 600 }}
+      - name: Borne surplus qualifiable
+        default_entity_id: binary_sensor.borne_surplus_qualifiable
+        unique_id: borne_surplus_qualifiable
+        state: >-
+          {{ is_state('binary_sensor.borne_conditions_solaires','on')
+             and is_state('input_boolean.borne_pilotage_solaire','on')
+             and states('input_number.borne_limite_ouverture') | float(0) > 0
+             and now().timestamp() >= (state_attr('input_datetime.borne_fin_pause','timestamp') | float(0))
+             and states('sensor.surplus_disponible_borne') | float(-1) >= 1400 }}
+      - name: Borne déficit confirmé
+        default_entity_id: binary_sensor.borne_deficit_confirme
+        unique_id: borne_deficit_confirme
+        delay_on: "00:01:00"
+        state: >-
+          {{ is_number(states('sensor.surplus_disponible_borne'))
+             and states('sensor.surplus_disponible_borne') | float(0) < 1400 }}
+
+sensor:
+  - platform: filter
+    name: "PV potentiel lissé"
+    entity_id: sensor.pv_potentiel_pyranometre
+    filters:
+      - filter: time_simple_moving_average
+        window_size: "00:00:30"
+
+input_boolean:
+  borne_pilotage_solaire:
+    name: Pilotage solaire
+
+input_number:
+  borne_limite_ouverture:
+    name: Limite d’ouverture
+    min: 0
+    max: 6400
+    step: 1
+    mode: box
+    unit_of_measurement: W
+
+input_select:
+  borne_phase:
+    name: Fenêtre solaire
+    options:
+      - Fermée
+      - Ouverture en cours
+      - Ouverte
+      - Fermeture en cours
+
+input_datetime:
+  borne_fin_pause:
+    name: Prochaine qualification possible
+    has_date: true
+    has_time: true
+
+automation:
+  - id: borne_arbitrage_solaire
+    alias: Borne — arbitrage solaire
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: homeassistant
+        event: start
+        id: reprise
+      - trigger: time_pattern
+        seconds: "/5"
+      - trigger: state
+        entity_id:
+          - input_boolean.borne_pilotage_solaire
+          - binary_sensor.borne_conditions_solaires
+          - binary_sensor.borne_deficit_confirme
+          - binary_sensor.borne_surplus_qualifiable
+    variables:
+      phase: "{{ states('input_select.borne_phase') }}"
+      actif: "{{ is_state('input_boolean.borne_pilotage_solaire', 'on') }}"
+      ferme: >-
+        {{ is_state('switch.blocage_d_injection','on')
+           and states('number.limite_d_injection') | float(-1) == 0 }}
+      demande: "{{ states('input_number.borne_limite_ouverture') | float(0) }}"
+      ouvert: >-
+        {{ is_state('switch.blocage_d_injection','off') and demande > 0
+           and states('number.limite_d_injection') | float(-1) == demande }}
+    actions:
+      - choose:
+          - conditions: >-
+              {{ phase in ['Ouverture en cours','Fermeture en cours']
+                 or (phase == 'Ouverte' and
+                     (trigger.id == 'reprise' or not actif or not ouvert
+                      or not is_state('binary_sensor.borne_conditions_solaires','on')
+                      or is_state('binary_sensor.borne_deficit_confirme','on')))
+                 or (phase == 'Fermée' and actif and not ferme) }}
+            sequence:
+              - action: input_select.select_option
+                target: {entity_id: input_select.borne_phase}
+                data: {option: Fermeture en cours}
+              - if: "{{ not is_state('switch.blocage_d_injection','on') }}"
+                then:
+                  - action: switch.turn_on
+                    target: {entity_id: switch.blocage_d_injection}
+                  - wait_template: "{{ is_state('switch.blocage_d_injection','on') }}"
+                    timeout: "00:03:30"
+                    continue_on_timeout: false
+              - if: "{{ states('number.limite_d_injection') | float(-1) != 0 }}"
+                then:
+                  - action: number.set_value
+                    target: {entity_id: number.limite_d_injection}
+                    data: {value: 0}
+                  - wait_template: "{{ states('number.limite_d_injection') | float(-1) == 0 }}"
+                    timeout: "00:03:30"
+                    continue_on_timeout: false
+              - condition: template
+                value_template: "{{ is_state('switch.blocage_d_injection','on') }}"
+              - action: input_datetime.set_datetime
+                target: {entity_id: input_datetime.borne_fin_pause}
+                data:
+                  timestamp: "{{ now().timestamp() + 600 }}"
+              - action: input_select.select_option
+                target: {entity_id: input_select.borne_phase}
+                data: {option: Fermée}
+
+          - conditions: >-
+              {% set q = states.binary_sensor.borne_surplus_qualifiable %}
+              {{ phase == 'Fermée' and ferme and actif and q is not none
+                 and q.state == 'on' and now().timestamp() - q.last_changed.timestamp() >= 300
+                 and as_timestamp(states('sensor.izypower_cloud_maison_derniere_mise_a_jour'),0) > q.last_changed.timestamp() }}
+            sequence:
+              - action: input_select.select_option
+                target: {entity_id: input_select.borne_phase}
+                data: {option: Ouverture en cours}
+              # Le contrôle actif et la limite zéro ont été vérifiés avant l’entrée.
+              - action: number.set_value
+                target: {entity_id: number.limite_d_injection}
+                data: {value: "{{ demande }}"}
+              - wait_template: >-
+                  {{ states('number.limite_d_injection') | float(-1) == demande
+                     or not is_state('binary_sensor.borne_surplus_qualifiable','on') }}
+                timeout: "00:03:30"
+                continue_on_timeout: false
+              - condition: template
+                value_template: >-
+                  {{ is_state('binary_sensor.borne_surplus_qualifiable','on')
+                     and is_state('switch.blocage_d_injection','on')
+                     and states('number.limite_d_injection') | float(-1) == demande }}
+              - action: switch.turn_off
+                target: {entity_id: switch.blocage_d_injection}
+              - wait_template: >-
+                  {{ is_state('switch.blocage_d_injection','off')
+                     or not is_state('input_boolean.borne_pilotage_solaire','on')
+                     or not is_state('binary_sensor.borne_conditions_solaires','on') }}
+                timeout: "00:03:30"
+                continue_on_timeout: false
+              - condition: template
+                value_template: >-
+                  {{ is_state('switch.blocage_d_injection','off')
+                     and is_state('binary_sensor.borne_conditions_solaires','on') }}
+              - action: input_select.select_option
+                target: {entity_id: input_select.borne_phase}
+                data: {option: Ouverte}

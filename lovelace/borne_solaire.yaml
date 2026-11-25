@@ -1,0 +1,31 @@
+type: vertical-stack
+cards:
+  - type: entities
+    title: Recharge solaire
+    show_header_toggle: false
+    entities:
+      - input_boolean.borne_pilotage_solaire
+      - input_number.borne_limite_ouverture
+      - type: simple-entity
+        entity: input_select.borne_phase
+      - entity: sensor.surplus_disponible_borne
+        name: Surplus estimé
+      - entity: sensor.isypower_cloud_maison_puissance_borne_de_recharge
+        name: Recharge mesurée
+      - entity: binary_sensor.heures_creuses
+        name: Heures creuses
+      - entity: binary_sensor.vehicule_branche
+        name: Véhicule branché
+      - binary_sensor.borne_conditions_solaires
+      - binary_sensor.borne_surplus_qualifiable
+      - binary_sensor.borne_deficit_confirme
+      - type: simple-entity
+        entity: input_datetime.borne_fin_pause
+      - entity: sensor.izypower_cloud_maison_derniere_mise_a_jour
+        name: Dernier relevé cloud
+  - type: history-graph
+    title: Surplus et recharge
+    hours_to_show: 6
+    entities:
+      - sensor.surplus_disponible_borne
+      - sensor.isypower_cloud_maison_puissance_borne_de_recharge
